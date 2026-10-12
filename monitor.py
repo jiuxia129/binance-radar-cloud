@@ -831,8 +831,9 @@ def main():
         except Exception as exc:
             log("推送失败: %s %s -> %s: %s" % (market, sym, type(exc).__name__, str(exc)[:160]))
 
-    # 4) OI 异动独立监控（全部合约币种）
-    oi_sent = check_oi_moves(st, agg, summary)
+    # 4) OI 异动独立监控（全部合约币种）——已按用户要求全部关闭，保留函数与快照供价格推送 OI 行使用
+    oi_sent = 0
+    # oi_sent = check_oi_moves(st, agg, summary)
 
     # 5) 强平轮询
     liq_sent = check_liquidation(st, summary)
