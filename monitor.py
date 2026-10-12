@@ -217,31 +217,46 @@ def coin_of_symbol(sym):
 # ---------------------------------------------------------------- 市值查询（CoinGecko，v1.12 新增）
 _CG_LIST_URL = "https://api.coingecko.com/api/v3/coins/list"
 _CG_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
+_CG_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=%d&price_change_percentage="
 _cg_map = {}
 _cg_map_ts = 0.0
 _CG_MAP_TTL = 3600.0          # 币种映射缓存 1 小时
 
 
 def _cg_symbol_map():
-    """SYMBOL -> CoinGecko id 映射（缓存）"""
+    """SYMBOL -> CoinGecko id 映射（缓存，按市值优先级避免同名小币干扰）"""
     global _cg_map, _cg_map_ts
     now = time.time()
     if _cg_map and now - _cg_map_ts < _CG_MAP_TTL:
         return _cg_map
-    try:
-        rows = http_json(_CG_LIST_URL, 25)
-        m = {}
-        for r in rows or []:
+    m = {}
+    # 1) 按市值从高到低覆盖：主流币命中官方 id（BTC->bitcoin 而非同名空气币）
+    for page in range(1, 5):
+        try:
+            rows = http_json(_CG_MARKETS_URL % page, 25)
+        except Exception:
+            rows = _http_json_proxy(_CG_MARKETS_URL % page, 25)
+        if not rows:
+            break
+        for r in rows:
             s = str(r.get("symbol") or "").upper()
             i = str(r.get("id") or "")
-            if s and i and s not in m:
+            if s and i:
                 m[s] = i
-        if m:
-            _cg_map = m
-            _cg_map_ts = now
-            log("CoinGecko 币种映射: %d 个" % len(m))
-    except Exception as exc:
-        log("CoinGecko 币种映射获取失败: %s" % str(exc)[:120])
+    # 2) 其余币种用全量列表兜底
+    try:
+        rows = http_json(_CG_LIST_URL, 30)
+    except Exception:
+        rows = _http_json_proxy(_CG_LIST_URL, 30)
+    for r in rows or []:
+        s = str(r.get("symbol") or "").upper()
+        i = str(r.get("id") or "")
+        if s and i and s not in m:
+            m[s] = i
+    if m:
+        _cg_map = m
+        _cg_map_ts = now
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), "CoinGecko 币种映射:", len(m), "个", flush=True)
     return _cg_map
 
 
