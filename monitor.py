@@ -6,8 +6,8 @@ Binance Radar Cloud v1.11.0 —— 云端全市场异动监控（GitHub Actions 
 现货（data-api 镜像）/ 合约（fapi 镜像）与 Bybit/OKX 公共接口均可直连。
 
 v1.11.0 新增（相对 v1.10.0）：
-  1. 全平台数据聚合（按币种）：Binance + Bybit + OKX 三家合约 OI、24h 合约成交额、
-     24h 现货成交额（近似 CoinGlass 全平台口径，三家为全球最大合约交易所，覆盖约 8 成）
+  1. 全平台数据聚合（按币种）：Binance + Gate + OKX + Bybit + Bitget 五家合约 OI、24h 合约成交额、
+     24h 现货成交额（近似 CoinGlass 全平台口径，五家为全球最大合约交易所）
   2. WxPusher 微信推送通道（appToken + UID），邮件通道保留，双通道并行
   3. 价格异动改为涨跌都推（窗口 |变化| >= 5%），推送中附加：
        24h 合约成交额：$X.XX亿 / 24h 现货成交额：$X.XX亿 / 全平台 OI：1小时前 X 3小时前 X 现在 X
@@ -41,6 +41,10 @@ LIQ_URL  = "https://fapi.binance.com/fapi/v1/allForceOrders"       # 合约强�
 BYBIT_TICKER = "https://api.bybit.com/v5/market/tickers"
 OKX_OI_URL   = "https://www.okx.com/api/v5/public/open-interest"
 OKX_TICKER   = "https://www.okx.com/api/v5/market/tickers"
+GATE_FUT     = "https://api.gateio.ws/api/v4/futures/usdt/tickers"   # Gate 合约 ticker（自带 total_size/quanto_multiplier）
+GATE_SPOT    = "https://api.gateio.ws/api/v4/spot/tickers"           # Gate 现货 ticker（quote_volume）
+BITGET_FUT   = "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES"  # Bitget 合约（自带 holdingAmount）
+BITGET_SPOT  = "https://api.bitget.com/api/v2/spot/market/tickers"   # Bitget 现货（usdtVolume）
 
 WIN_MIN = 5
 UP_PCT = 5.0            # 价格异动阈值 %（涨跌都推）
@@ -71,7 +75,7 @@ WX_TOKEN = os.environ.get("WXPUSHER_APP_TOKEN", "").strip()
 WX_UID = os.environ.get("WXPUSHER_UID", "").strip()
 WX_URL = "https://wxpusher.zjiecode.com/api/send/message"
 
-UA = "Mozilla/5.0 BinanceRadarCloud/1.11 (GitHub Actions)"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36 BinanceRadarCloud/1.11"
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
 _SSL_CTX.verify_mode = ssl.CERT_NONE
@@ -210,7 +214,82 @@ def coin_of_symbol(sym):
     return s
 
 
-# ---------------------------------------------------------------- 三大所数据聚合（按币种）
+# ---------------------------------------------------------------- 市值查询（CoinGecko，v1.12 新增）
+_CG_LIST_URL = "https://api.coingecko.com/api/v3/coins/list"
+_CG_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
+_cg_map = {}
+_cg_map_ts = 0.0
+_CG_MAP_TTL = 3600.0          # 币种映射缓存 1 小时
+
+
+def _cg_symbol_map():
+    """SYMBOL -> CoinGecko id 映射（缓存）"""
+    global _cg_map, _cg_map_ts
+    now = time.time()
+    if _cg_map and now - _cg_map_ts < _CG_MAP_TTL:
+        return _cg_map
+    try:
+        rows = http_json(_CG_LIST_URL, 25)
+        m = {}
+        for r in rows or []:
+            s = str(r.get("symbol") or "").upper()
+            i = str(r.get("id") or "")
+            if s and i and s not in m:
+                m[s] = i
+        if m:
+            _cg_map = m
+            _cg_map_ts = now
+            log("CoinGecko 币种映射: %d 个" % len(m))
+    except Exception as exc:
+        log("CoinGecko 币种映射获取失败: %s" % str(exc)[:120])
+    return _cg_map
+
+
+def fetch_mcap(coins):
+    """批量查市值，入参为归一化币种（BTC/1000PEPE），返回 {COIN: usd}；失败返回 {}"""
+    if not coins:
+        return {}
+    m = _cg_symbol_map()
+    want = {}
+    for c in coins:
+        c = str(c).upper()
+        i = m.get(c)
+        if i:
+            want[c] = i
+    if not want:
+        return {}
+    out = {}
+    try:
+        url = _CG_PRICE_URL + "?ids=%s&vs_currencies=usd&include_market_cap=true" % ",".join(want.values())
+        d = http_json(url, 20)
+        for c, i in want.items():
+            cap = (d.get(i) or {}).get("usd_market_cap")
+            if cap:
+                out[c] = float(cap)
+    except Exception as exc:
+        log("市值查询失败: %s" % str(exc)[:120])
+    return out
+
+
+def fmt_mcap(v):
+    if not v:
+        return "--"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "--"
+    if f != f:
+        return "--"
+    if f >= 1e12:
+        return "$%.2f万亿" % (f / 1e12)
+    if f >= 1e8:
+        return "$%.2f亿" % (f / 1e8)
+    if f >= 1e4:
+        return "$%.2f万" % (f / 1e4)
+    return "$%.2f" % f
+
+
+# ---------------------------------------------------------------- 五大所数据聚合（按币种）
 def fetch_binance(st):
     """Binance 合约 ticker + 逐币 OI（并发）+ 现货 24h 成交额"""
     info = {}
@@ -321,10 +400,62 @@ def fetch_okx(st):
     return info
 
 
+def fetch_gate(st):
+    """Gate（芝麻开门）合约 + 现货 ticker：自带 total_size / quanto_multiplier / volume_24h_quote"""
+    info = {}
+    j = http_json(GATE_FUT, timeout=30)
+    for x in j or []:
+        contract = str(x.get("contract") or "").strip()
+        last = _to_float(x.get("last"))
+        if not contract or last <= 0:
+            continue
+        coin = contract.rsplit("_", 1)[0] if "_" in contract else contract
+        oi_usd = _to_float(x.get("total_size")) * _to_float(x.get("quanto_multiplier")) * last
+        c = info.setdefault(coin, {"oi": 0.0, "futVol24": 0.0, "spotVol24": 0.0})
+        c["oi"] += oi_usd
+        c["futVol24"] += _to_float(x.get("volume_24h_quote"))
+        c["chg24"] = max(c.get("chg24", 0.0), _to_float(x.get("change_percentage")))
+    j = http_json(GATE_SPOT, timeout=30)
+    for x in j or []:
+        pair = str(x.get("currency_pair") or "").strip()
+        if not pair.endswith("_USDT"):
+            continue
+        coin = pair.rsplit("_", 1)[0]
+        c = info.setdefault(coin, {"oi": 0.0, "futVol24": 0.0, "spotVol24": 0.0})
+        c["spotVol24"] += _to_float(x.get("quote_volume"))
+    return info
+
+
+def fetch_bitget(st):
+    """Bitget 合约 + 现货 ticker：合约自带 holdingAmount（币数量）"""
+    info = {}
+    j = http_json(BITGET_FUT, timeout=30)
+    for x in (j.get("data") or []):
+        sym = str(x.get("symbol") or "").strip()
+        last = _to_float(x.get("lastPr"))
+        if not sym or last <= 0:
+            continue
+        coin = coin_of_symbol(sym)
+        oi_usd = _to_float(x.get("holdingAmount")) * last
+        c = info.setdefault(coin, {"oi": 0.0, "futVol24": 0.0, "spotVol24": 0.0})
+        c["oi"] += oi_usd
+        c["futVol24"] += _to_float(x.get("usdtVolume"))
+        c["chg24"] = max(c.get("chg24", 0.0), abs(_to_float(x.get("change24h"))) * 100)
+    j = http_json(BITGET_SPOT, timeout=30)
+    for x in (j.get("data") or []):
+        sym = str(x.get("symbol") or "").strip()
+        if not sym.endswith("USDT"):
+            continue
+        coin = coin_of_symbol(sym)
+        c = info.setdefault(coin, {"oi": 0.0, "futVol24": 0.0, "spotVol24": 0.0})
+        c["spotVol24"] += _to_float(x.get("usdtVolume"))
+    return info
+
+
 def fetch_aggregated(st):
-    """聚合三大所，按币种合并"""
+    """聚合五大所，按币种合并"""
     merged = {}
-    for fn in (fetch_binance, fetch_bybit, fetch_okx):
+    for fn in (fetch_binance, fetch_bybit, fetch_okx, fetch_gate, fetch_bitget):
         try:
             part = fn(st)
         except Exception as exc:
@@ -346,6 +477,8 @@ def update_oi_snapshot(st, agg):
     oi_hist = st.setdefault("oiHist", {})
     now = int(time.time() * 1000)
     for coin, c in agg.items():
+        if c["oi"] < 100000:
+            continue                                   # 过滤灰尘币，避免 state.json 膨胀
         q = oi_hist.setdefault(coin, [])
         q.append([now, round(c["oi"], 2)])
         if len(q) > OI_SNAP_MAX:
@@ -400,6 +533,7 @@ def check_oi_moves(st, agg, summary):
             "币种     : %s" % coin,
             "类型     : OI 全平台持仓异动（1小时窗口）",
             "变化     : %s%.1f%%" % ("+" if pct >= 0 else "", pct),
+            "市值     : %s" % fmt_mcap(fetch_mcap([coin]).get(coin)),
             "全平台 OI：1小时前 %s" % fmt_usd(prev1h),
             "          3小时前 %s" % (fmt_usd(prev3h) if prev3h else "--（数据积累中）"),
             "          现在     %s" % fmt_usd(cur),
@@ -408,7 +542,7 @@ def check_oi_moves(st, agg, summary):
             "24h 现货成交额：%s" % fmt_usd(agg[coin]["spotVol24"]),
             "",
             "推送时间 : %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
-            "由云端服务器监控（电脑关机不影响），参考 CoinGlass 全平台口径（Binance+Bybit+OKX 聚合），仅供参考不构成投资建议。",
+            "由云端服务器监控（电脑关机不影响），参考 CoinGlass 全平台口径（Binance+Gate+OKX+Bybit+Bitget 聚合），仅供参考不构成投资建议。",
         ]
         body = "\n".join(lines)
         try:
@@ -476,6 +610,8 @@ def check_liquidation(st, summary):
             continue
         last[cooldown_key] = now
         direction = "多单爆仓" if side == "SELL" else ("空单爆仓" if side == "BUY" else "强平")
+        coin = coin_of_symbol(sym)
+        mcap = fetch_mcap([coin]).get(coin) if coin else None
         subject = "[Binance云端] %s 大额强平·%s %s" % (sym, direction, fmt_usd(notional))
         body = "\n".join([
             "Binance Radar Cloud 大额强平提醒",
@@ -487,6 +623,7 @@ def check_liquidation(st, summary):
             "强平价格 : %s" % fmt_num(avg),
             "成交数量 : %s" % fmt_num(qty),
             "名义价值 : %s USDT" % fmt_usd(notional),
+            "市值     : %s" % fmt_mcap(mcap),
             "评分     : %s 级" % liq_level_of(notional),
             "操作建议 : %s" % liq_advice(side),
             "",
@@ -593,7 +730,7 @@ def main():
     win_ms = WIN_MIN * 60000
     summary = []
 
-    # 1) 三大所聚合数据（OI + 24h 成交额，按币种）
+    # 1) 五大所聚合数据（OI + 24h 成交额，按币种）
     agg = {}
     try:
         agg = fetch_aggregated(st)
@@ -646,6 +783,7 @@ def main():
         coin = coin_of_symbol(sym)
         sc = min(100, int(round(abs(chg) * 6)))
         direction = "暴涨" if chg >= 0 else "暴跌"
+        mcap = fetch_mcap([coin]).get(coin) if coin else None
         subject = "[Binance云端] %s 5分钟%s %.2f%%（%s）" % (sym, direction, chg, market.upper())
         body_lines = [
             "Binance Radar Cloud 云端异动提醒",
@@ -655,6 +793,7 @@ def main():
             "类型     : BURST 窗口异动",
             "窗口涨幅 : %+.2f%%（%d 分钟）" % (chg, WIN_MIN),
             "最新价   : %s" % fmt_num(i.get("price", 0.0)),
+            "市值     : %s" % fmt_mcap(mcap),
             "24h涨幅  : %+.2f%%" % i.get("chg24", 0.0),
             "评分     : %s 级" % level_of(sc),
             "操作建议 : %s" % advice_of(sc),
